@@ -1,0 +1,137 @@
+local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+
+local LP = Players.LocalPlayer
+local PLACE_ID = game.PlaceId
+local CURRENT_JOB = game.JobId
+
+local HOP_MAX_ATTEMPTS = 4
+local HOP_FAIL_TIMEOUT = 6
+
+-- Kompatibilitas berbagai executor
+local httpRequest = (syn and syn.request) or http_request or request or (http and http.request)
+
+local doneCalled = false
+local failedConn
+local attempt = 0
+local candidates = {}
+
+local function getServers()
+	local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true"):format(PLACE_ID)
+
+	local ok, body = pcall(function()
+		if httpRequest then
+			local res = httpRequest({ Url = url, Method = "GET" })
+			return res.Body
+		end
+		return game:HttpGet(url)
+	end)
+
+	if not ok or not body then
+		warn("[AutoBMHop] Gagal mengambil server list:", body)
+		return nil
+	end
+
+	local okDecode, decoded = pcall(function()
+		return HttpService:JSONDecode(body)
+	end)
+	if not okDecode or not decoded then
+		warn("[AutoBMHop] Response bukan JSON valid:", tostring(body):sub(1, 100))
+		return nil
+	end
+	if decoded.errors then
+		warn("[AutoBMHop] API error:", decoded.errors[1] and decoded.errors[1].message)
+		return nil
+	end
+	return decoded.data
+end
+
+local function finish()
+	doneCalled = true
+	if failedConn then
+		failedConn:Disconnect()
+		failedConn = nil
+	end
+end
+
+local tryNext
+
+tryNext = function()
+	if doneCalled then return end
+
+	if attempt >= HOP_MAX_ATTEMPTS then
+		warn("[AutoBMHop] Batas percobaan tercapai (" .. HOP_MAX_ATTEMPTS .. ")")
+		finish()
+		return
+	end
+
+	local target = table.remove(candidates)
+	if not target then
+		warn("[AutoBMHop] Tidak ada server lain yang tersedia")
+		finish()
+		return
+	end
+
+	attempt = attempt + 1
+	local myAttempt = attempt
+	print(("[AutoBMHop] Percobaan %d/%d -> %s"):format(myAttempt, HOP_MAX_ATTEMPTS, target))
+
+	local ok, err = pcall(function()
+		TeleportService:TeleportToPlaceInstance(PLACE_ID, target, LP)
+	end)
+
+	if not ok then
+		warn("[AutoBMHop] Teleport error:", err)
+		task.wait(1)
+		return tryNext()
+	end
+
+	-- Timeout: kalau masih di server ini setelah HOP_FAIL_TIMEOUT detik, coba server lain
+	task.delay(HOP_FAIL_TIMEOUT, function()
+		if doneCalled or attempt ~= myAttempt then return end
+		warn(("[AutoBMHop] Timeout %ds, coba server lain..."):format(HOP_FAIL_TIMEOUT))
+		tryNext()
+	end)
+end
+
+local function serverHop()
+	print("[AutoBMHop] Mengambil server list...")
+	local servers = getServers()
+	if not servers then return end
+
+	for _, server in ipairs(servers) do
+		if server.id ~= CURRENT_JOB and server.playing < server.maxPlayers - 1 then
+			table.insert(candidates, server.id)
+		end
+	end
+
+	print("[AutoBMHop] Kandidat server:", #candidates)
+
+	if #candidates == 0 then
+		warn("[AutoBMHop] Tidak ada server lain yang tersedia")
+		return
+	end
+
+	-- Acak urutan kandidat
+	for i = #candidates, 2, -1 do
+		local j = math.random(1, i)
+		candidates[i], candidates[j] = candidates[j], candidates[i]
+	end
+
+	failedConn = TeleportService.TeleportInitFailed:Connect(
+		function(player, teleportResult)
+			if player ~= LP or doneCalled then return end
+
+			warn(("[AutoBMHop] Teleport gagal (%s), retry ke server lain...")
+				:format(tostring(teleportResult)))
+
+			task.wait(1)
+			tryNext()
+		end
+	)
+
+	tryNext()
+end
+
+serverHop()
